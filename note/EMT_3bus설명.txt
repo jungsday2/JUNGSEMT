@@ -1,0 +1,206 @@
+EMT_TEST/
+├── main_emt_3bus.py            ─ 진입점 (시나리오 선택, plot)
+└── EMT_3bus/                   ─ 패키지
+    ├── base_component.py       ─ 통일 인터페이스 (5개 메서드 컨트랙트)
+    ├── bus_manager.py          ─ 모선 ID ↔ 0-indexed 슬롯 매핑
+    ├── park.py                 ─ abc ↔ dq0 변환 (Kundur)
+    ├── voltage_source.py       ─ 이상 전원 (해석적, 이산화 없음)
+    ├── transmission_line.py    ─ pi-model + 사다리꼴
+    ├── load.py                 ─ Constant-Z (R / RL / RC)
+    ├── generator.py            ─ GENROU 6th order
+    └── simulator.py            ─ 솔버 (build → init → step → run)
+
+EMT 시뮬레이션 알고리즘
+─── step k 시작 ─── 시각 t_k = k·Δt ───────────────
+│
+│  ① predict_state(dt, t_k)               ◀ 솔브 직전 외삽
+│     ├ VoltageSource: self._t = t_k 캐싱
+│     ├ Generator: δ_pred = δ + Δt·ω_0·Δω
+│     │            θ_pred = ω_0·t_k + δ_pred
+│     │            e''_d = -ψ''_q, e''_q = +ψ''_d
+│     │            e''_abc(t_k) = inv_Park(e''_dq, θ_pred)
+│     └ 라인/부하: no-op (선형 시불변)
+│
+│  ② stamp_history_current(I_total)       ◀ 우변 I 벡터 조립
+│     ├ VoltageSource:  +V_phase(t_k)/R_int  (Norton 전원)
+│     ├ Line R-L 직렬:  ±I_hist^RL  (from→to 방향)
+│     ├ Line R-C 션트:  -I_hist^RC  (각 끝)
+│     ├ Load:           -I_hist (RL 또는 RC 따라)
+│     └ Generator:      +G_gen·(e''(t)+e''(t-Δt)) - I_hist^RL
+│
+│  ③ V_nodes = LU.solve(I_total)          ◀ G·V = I 풀이
+│     (G는 build()에서 미리 LU 분해됨 — 토폴로지 안 변하면 재분해 X)
+│
+│  ④ update_branch(V_nodes)               ◀ 솔브 후 상태 갱신
+│     ├ Line: i_series, i_shunt, v_C_*, v_*_prev 모두 trapezoidal 한 스텝 진행
+│     ├ Load: i_branch, v_C 등 갱신
+│     ├ VoltageSource: 메모리 없음 (no-op)
+│     └ Generator: 큰 일 → 아래 ⑤
+│
+│  ⑤ Generator의 update_branch (가장 복잡):
+│     a. V_term_abc → Park(θ_pred) → v_d, v_q
+│     b. Algebraic stator로 i_d, i_q 산출 (Cramer)
+│        v_d = -R_a·i_d + X''_q·i_q - ψ''_q
+│        v_q = -R_a·i_q - X''_d·i_d + ψ''_d
+│     c. GENROU 4 electrical ODE 미분값 (E'_q, E'_d, ψ''_d, ψ''_q)
+│     d. T_e = ψ''_d·i_q - ψ''_q·i_d
+│     e. Swing: dδ/dt = ω_0·Δω, dΔω/dt = (T_m - T_e - D·Δω)/(2H)
+│     f. 명시적 Euler로 6 상태 변수 한 스텝 적분
+│     g. e_pp_abc_prev ← e_pp_abc_now (다음 스텝 history용)
+│
+│  ⑥ self._t += Δt                        ◀ 시각 진행
+│
+─── step k 종료 ──────────────────────────────────
+
+핵심 통찰:
+
+①과 ②는 "미래 정보" (t_k의 V를 모르는 상태에서 t_k에 대한 추정)로 G·V=I 풀이를 가능하게 함
+④, ⑤는 "진짜 상태"를 솔브된 V로 갱신
+외삽(①)이 살짝 부정확해도 G에 발전기 임피던스 ($R_a + L''_d$)가 들어가 있어 implicit coupling이 자기 보정
+
+2. Bumpless start 알고리즘 (Stage 6)
+sim.initialize() 의 반복 fixed-point 풀이:
+
+
+Y_phasor = ∑ comp.stamp_Y_phasor(ω)        ◀ 한 번만 (변하지 않음)
+
+for it in range(max_iter):
+    I_phasor = 0
+    for each component:
+        I_phasor += comp.stamp_I_phasor(ω)  ◀ 매번 갱신 (gen의 e''_phasor 의존)
+    
+    V_phasor = solve(Y, I_phasor)
+    
+    for each component:
+        comp.initialize_states(V_phasor, ω, dt)  ◀ 위상자에서 t=-Δt 인스턴스 역산
+    
+    if max|ΔV_phasor| < tol: break
+
+# t=0 시점 V_nodes 세팅 + sim._t = 0
+왜 반복? 발전기의 e''_phasor는 회전자 상태에 의존, 회전자 상태는 V_phasor에 의존, V_phasor는 e''_phasor에 의존 → 닭과 달걀.
+
+왜 수렴? Slack이 강해서 발전기의 V 영향력 작음 → 수축 계수 ~0.15 → 매 iter 6.5배 좁혀짐 → 11 iter면 ε=1e-9.
+
+
+발전기 backsolve 핵심 (initialize_states)
+
+V_term_p = V_phasor[gen_bus]
+P_op = T_m,  Q_op = params['Q_op']
+
+I_gen_p = (P_op - jQ_op) / V_term_p*
+
+E_q_fic = V_term_p + (R_a + j·X_q)·I_gen_p
+δ_ss = ∠E_q_fic - π/2          ◀ 부하각 도출
+
+V_dq = V_term_p · e^(-jδ_ss),    I_dq = I_gen_p · e^(-jδ_ss)
+
+# stator algebraic에서 ψ'' 직접 backsolve (자동 일관성)
+ψ''_q = -R_a·i_d + X''_q·i_q - v_d
+ψ''_d = v_q + R_a·i_q + X''_d·i_d
+
+# rotor ODE 정상상태 조건에서 E'_q, E'_d, E_fd backsolve
+E'_q = ψ''_d + (X'_d - X_l)·i_d
+E_fd = E'_q + (X_d - X'_d)·i_d   ◀ 사용자 입력 OVERRIDE!
+E'_d = -ψ''_q - (X'_q - X_l)·i_q
+
+# t=-Δt 시점 인스턴스 값으로 모든 이력 세팅
+v_term_prev   = phasor_to_3phase_at(V_term_p,  ω, -Δt)
+i_term_prev   = phasor_to_3phase_at(-I_gen_p,  ω, -Δt)   ◀ 부호 반전 (gen→load conv.)
+e_pp_abc_prev = phasor_to_3phase_at(e_pp_phasor, ω, -Δt)
+왜 E_fd override?
+
+Simple GENROU의 ψ''_d ODE는 $X'_d - X_l$ 사용
+물리적으로는 $X_d - X''_d$ 가 맞음
+$X''_d ≠ X_l$ 일 때 두 식이 어긋남 → stator algebraic이 만족 안 됨
+자동 보정: 사용자 E_fd 무시하고 운전점에 맞는 값으로 강제
+
+3. 컴포넌트별 모델 요약
+TransmissionLine (pi-model)
+
+bus_from ──[R-L 직렬 || R_dL]── bus_to
+   │                              │
+[R_dC + C/2]                  [R_dC + C/2]   ◀ R_dC=0이면 순수 C
+   │                              │
+  ground                        ground
+
+Trapezoidal:
+  G_series = 1/(R + 2L/Δt) + 1/R_dL  ◀ 인덕터 병렬 댐핑
+  G_shunt  = C/((1+damping_C)·Δt)    ◀ 콘덴서 직렬 댐핑
+  α        = (2L/Δt - R)/(2L/Δt + R)
+  
+상태 (3상):
+  i_series_prev (i_RL — 인덕터 분기만, 댐핑 R 분 제외)
+  i_shunt_from/to_prev
+  v_from/to_prev (모선 V 이력, R-L history용)
+  v_C_from/to_prev (콘덴서 단자 V, R-C history용)
+
+set_active(False) 시: 모든 stamping no-op (트립)
+Load (Constant-Z, kind ∈ {R, RL, RC})
+
+P, Q, V_nom 입력 → Z = R + jX = V_nom²/(P-jQ) 산출
+X 부호로 kind 분기:
+  X > 0  → 'RL' (유도성)  : trapezoidal R-L (라인과 동형)
+  X < 0  → 'RC' (용량성)  : trapezoidal R-C 직렬 (v_C 별도 추적)
+  X = 0  → 'R'            : 단순 G_eq = 1/R, 이력 없음
+
+set_operating_point(P, Q): 계수 재계산 (kind 변경 불가, 이력 보존)
+VoltageSource
+
+v_phase(t) = V_mag · cos(ω_0·t + φ + offset_phase)
+  offset = [0, -2π/3, +2π/3] (3상)
+
+Norton 등가:
+  G_int = 1/R_internal
+  I_norton(t) = v_phase(t) · G_int  ◀ 매 스텝 함수값 샘플링
+
+이산화 없음 (미분 방정식 미보유)
+Generator (GENROU 6th)
+
+상태 변수 6개:
+  E'_q, E'_d        (transient EMF — T'_d0=8s, T'_q0=1s)
+  ψ''_d, ψ''_q      (subtransient flux — T''_d0=30ms, T''_q0=70ms)
+  δ, Δω             (rotor angle, speed deviation)
+
+단자 인터페이스: R-L 직렬 (R_a + L''_d) + 시변 EMF e''_abc(t)
+  → 라인의 R-L과 동형 (재사용)
+  → 단, EMF 부분이 매 스텝 회전자 상태에서 새로 계산됨
+
+GENROU 4 ODE (simple form):
+  T'_d0  Ė'_q   = E_fd - E'_q - (X_d - X'_d)·i_d
+  T''_d0 ψ̇''_d = E'_q - ψ''_d - (X'_d - X_l)·i_d
+  T'_q0  Ė'_d   = -E'_d + (X_q - X'_q)·i_q
+  T''_q0 ψ̇''_q = -E'_d - ψ''_q - (X'_q - X_l)·i_q
+
+Swing:
+  δ̇    = ω_0·Δω
+  2H Δω̇ = T_m - T_e - D·Δω,   T_e = ψ''_d·i_q - ψ''_q·i_d
+
+적분: 명시적 Euler (slow rotor + small dt → 안정)
+
+4. 핵심 컨벤션 정리
+항목	선택	이유
+Park 변환	Kundur, 2/3 amplitude-invariant	                   dq peak가 abc peak와 일치
+위상자	Peak amplitude + 3-phase p.u.	                    $S = V \cdot I^*$ 그대로 (RMS 변환 X)
+전류 부호	i_term = bus→gen INTO (load 방향)	           라인·부하와 동형
+                i_d, i_q = gen→bus OUT (machine 방향)	                           발전기 표준
+회전자 각	$\theta_{Park} = \omega_0 t + \delta$	             absolute 각도 (절대 stator 기준)
+시간 인덱스	step k에서 self._t = k·Δt	                    step()이 끝날 때 진행
+
+5. 외란 / 토폴로지 변경 메커니즘
+
+시점 t = T_EVENT 에서:
+
+[load step]         load.set_operating_point(P, Q)
+                    → kind 그대로, 계수 재계산
+                    → sim.rebuild_G() 필수
+
+[line trip]         line.set_active(False)
+                    → 모든 stamping no-op
+                    → sim.rebuild_G() 필수
+
+[reclose]           line.set_active(True)
+                    → 다시 활성, 이력은 그대로 (재투입)
+
+rebuild_G():        G ← 0; for comp: comp.stamp_G(G)
+                    LU ← splu(csc_matrix(G))
+                    (기존 이력 보존, G만 재구성)
