@@ -117,35 +117,58 @@ class ParaEMTSimulator:
             for comp in self.components:
                 comp.stamp_Y_phasor(Y, omega)
 
-            # 반복 풀이
-            V_phasor = np.zeros(N_buses, dtype=complex)
-            for it in range(max_iter):
-                # I_phasor는 능동 소자 상태에 의존 → 매 반복 재빌드
+            # 잔차(Residual) 계산 헬퍼 함수
+            def eval_residual(V_cplx):
+                for comp in self.components:
+                    comp.initialize_states(V_cplx, omega, self.dt)
                 I_ph = np.zeros(N_buses, dtype=complex)
                 for comp in self.components:
                     comp.stamp_I_phasor(I_ph, omega)
+                return Y @ V_cplx - I_ph
 
-                V_phasor_new = np.linalg.solve(Y, I_ph)
+            # 반복 풀이 (Newton-Raphson)
+            # NR은 V=0에서 출발하면 발전기(I = S*/V*) 연산 시 0으로 나누게 되므로 Flat Start(1+j0) 사용
+            V_phasor = np.ones(N_buses, dtype=complex)
+            for it in range(max_iter):
+                F0 = eval_residual(V_phasor)
+                F0_vec = np.concatenate([F0.real, F0.imag])
 
-                # 모든 컴포넌트 상태를 새 V_phasor로 재초기화
-                for comp in self.components:
-                    comp.initialize_states(V_phasor_new, omega, self.dt)
+                # 수치적 야코비안(Numerical Jacobian) 구성
+                # (각 컴포넌트에 stamp_J_phasor를 추가하는 보일러플레이트를 피하기 위해)
+                eps = 1e-6
+                J = np.zeros((2 * N_buses, 2 * N_buses))
+                for i in range(N_buses):
+                    # Real 축 미분
+                    V_pert = V_phasor.copy()
+                    V_pert[i] += eps
+                    F_pert = eval_residual(V_pert)
+                    J[:, i] = (np.concatenate([F_pert.real, F_pert.imag]) - F0_vec) / eps
 
-                # 수렴 체크 (첫 반복은 비교 대상 없음)
-                if it > 0:
-                    diff = float(np.max(np.abs(V_phasor_new - V_phasor)))
+                    # Imag 축 미분
+                    V_pert = V_phasor.copy()
+                    V_pert[i] += 1j * eps
+                    F_pert = eval_residual(V_pert)
+                    J[:, N_buses + i] = (np.concatenate([F_pert.real, F_pert.imag]) - F0_vec) / eps
+
+                # 풀이 및 업데이트
+                dX = np.linalg.solve(J, -F0_vec)
+                dV = dX[:N_buses] + 1j * dX[N_buses:]
+                V_phasor += dV
+
+                diff = float(np.max(np.abs(dV)))
+                if verbose:
+                    print(f"  NR iter {it}: max|ΔV_phasor| = {diff:.2e}")
+                if diff < tol:
                     if verbose:
-                        print(f"  iter {it}: max|ΔV_phasor| = {diff:.2e}")
-                    if diff < tol:
-                        if verbose:
-                            print(f"  Phasor iteration converged in {it+1} iters")
-                        V_phasor = V_phasor_new
-                        break
-                V_phasor = V_phasor_new
+                        print(f"  NR converged in {it+1} iters")
+                    break
             else:
                 if verbose:
-                    print(f"  Phasor iteration did not converge in {max_iter} iters "
-                          f"(last diff = {diff:.2e})")
+                    print(f"  NR did not converge in {max_iter} iters (last diff = {diff:.2e})")
+            
+            # 최종 V_phasor로 내부 상태 확정
+            for comp in self.components:
+                comp.initialize_states(V_phasor, omega, self.dt)
         else:
             # 사용자 지정 V_phasor → 단일 패스
             for comp in self.components:

@@ -5,9 +5,10 @@
 EMT_3bus 시뮬레이터 — Bus 2 = Generator 고정 진입점.
 
 설정:
-    SCENARIO: 'load_step' | 'line_trip'
+    SCENARIO: 'load_step' | 'line_trip' | 'load_step_temp' | 'line_trip_temp'
         'load_step' — t=T_EVENT에 부하 P,Q 변경
         'line_trip' — t=T_EVENT에 라인 2-3 트립 (3상 개방)
+        '_temp' 접미사 — t=T_EVENT에 동작 후 10*dt 후에 원래 상태로 복귀
 
 (VS 모드 검증용 분기는 _archive/main_emt_3bus_VS.py 에 백업되어 있음.)
 """
@@ -28,16 +29,24 @@ from EMT_3bus import (
 # ============================================================
 # 시나리오 / 시뮬레이션 설정 (자주 바꾸는 값들)
 # ============================================================
-SCENARIO    = 'load_step'   # 'load_step' | 'line_trip'
-T_EVENT     = 4
+SCENARIO    = 'load_step_temp'   # 'load_step' | 'line_trip' | 'load_step_temp' | 'line_trip_temp'
+T_EVENT     = 4.0
 DT          = 50e-6
-T_END       = 10
+T_END       = 10.0
 
-# load_step 시 새 운전점 (10× 시나리오)
-LOAD_NEW    = {'P': 8.0, 'Q': 4.0}
+# 일시적 외란 (temp) 시나리오에서의 지속 시간 (20 * steptime)
+TEMP_DURATION = 20 * DT
+
+# 실제값 변환을 위한 Base Voltage (예: Kundur 24kV L-L RMS -> L-N Peak)
+V_BASE_KV   = 24.0 * np.sqrt(2/3)  # 약 19.596 kV (Phase-to-Neutral Peak)
+PLOT_IN_KV  = True  # True면 실제 kV 단위로, False면 pu로 출력
+
+# load_step 시 새 운전점 및 원본 유지용
+LOAD_ORIGINAL = {'P': 0.8, 'Q': 0.4}
+LOAD_NEW      = {'P': 8.0, 'Q': 4.0}
 
 # Bus 2 Generator 파라미터
-GEN_PARAMS  = {'T_m': 0.8, 'E_fd': 1.0, 'Q_op': 0.2, 'D': 0.0}
+GEN_PARAMS  = {'T_m': 0.824, 'E_fd': 2.0, 'Q_op': 0.2, 'D': 0.0}
 
 # .mat 저장 설정
 SAVE_MAT      = True
@@ -68,14 +77,14 @@ def build_simulator():
     # Bus 2: Generator (GENROU 6th)
     gen = Generator(
         bus=2, bus_manager=sim.bus_manager, dt=sim.dt,
-        params=GEN_PARAMS,
+        params=GEN_PARAMS, is_slack=False, V_mag=1.01, V_angle=0.83 * np.pi / 180
     )
     sim.add(gen)
 
     # Bus 3: 부하
     load = Load(
         bus=3,
-        params={'P': 0.8, 'Q': 0.4, 'V_nom': 1.0, 'f_sys': 60.0},
+        params={'P': LOAD_ORIGINAL['P'], 'Q': LOAD_ORIGINAL['Q'], 'V_nom': 1.0, 'f_sys': 60.0},
         dt=sim.dt, bus_manager=sim.bus_manager,
     )
     sim.add(load)
@@ -89,14 +98,24 @@ def build_simulator():
 # ============================================================
 def apply_event(sim, line_2_3, load):
     """SCENARIO에 따라 외란 적용. (G 행렬 재구성 포함)"""
-    if SCENARIO == 'load_step':
+    if SCENARIO.startswith('load_step'):
         load.set_operating_point(**LOAD_NEW)
         print(f"  >>> Load step: P→{LOAD_NEW['P']}, Q→{LOAD_NEW['Q']}")
-    elif SCENARIO == 'line_trip':
+    elif SCENARIO.startswith('line_trip'):
         line_2_3.set_active(False)
         print(f"  >>> Line 2-3 tripped (3상 개방)")
     else:
         raise ValueError(f"Unknown SCENARIO: {SCENARIO}")
+    sim.rebuild_G()
+
+def clear_event(sim, line_2_3, load):
+    """SCENARIO에 따라 외란 복구 (temp 시나리오용). (G 행렬 재구성 포함)"""
+    if SCENARIO.startswith('load_step'):
+        load.set_operating_point(**LOAD_ORIGINAL)
+        print(f"  >>> Load restored: P→{LOAD_ORIGINAL['P']}, Q→{LOAD_ORIGINAL['Q']}")
+    elif SCENARIO.startswith('line_trip'):
+        line_2_3.set_active(True)
+        print(f"  >>> Line 2-3 restored (3상 재투입)")
     sim.rebuild_G()
 
 
@@ -116,14 +135,22 @@ def run_simulation(sim, gen, line_2_3, load):
     }
 
     event_done = False
+    event_cleared = False
     print(f"Running {n_steps} steps...")
     for k in range(n_steps):
         out['time'][k] = sim._t
 
         if (not event_done) and (sim._t >= T_EVENT):
-            print(f"  Event '{SCENARIO}' at t={sim._t:.4f}s")
+            print(f"  Event '{SCENARIO}' applied at t={sim._t:.4f}s")
             apply_event(sim, line_2_3, load)
             event_done = True
+            
+        if event_done and (not event_cleared) and SCENARIO.endswith('_temp'):
+            # 지정된 시간 만큼 진행 후 원래 상태로 복구
+            if sim._t >= T_EVENT + TEMP_DURATION:
+                print(f"  Event cleared at t={sim._t:.4f}s")
+                clear_event(sim, line_2_3, load)
+                event_cleared = True
 
         sim.step()
         out['V'][:, k]    = sim._V_nodes
@@ -147,7 +174,7 @@ def plot_gen_scenario(sim, gen, data):
 
     # (0,0) δ
     ax = axes[0, 0]
-    ax.plot(t_ms, np.degrees(data['delta']), 'b-', lw=1.0)
+    ax.plot(t_ms, np.degrees(data['delta']) * np.pi/180, 'b-', lw=1.0)
     ax.axvline(t_event_ms, color='r', ls='--', lw=0.8, label='event')
     ax.set_title('Rotor angle δ [deg]')
     ax.set_xlabel('Time [ms]'); ax.set_ylabel('δ [deg]')
@@ -155,11 +182,11 @@ def plot_gen_scenario(sim, gen, data):
 
     # (0,1) Δω
     ax = axes[0, 1]
-    ax.plot(t_ms, data['omega'] * 100, 'r-', lw=1.0)
+    ax.plot(t_ms, data['omega'] * gen.omega_0, 'r-', lw=1.0)
     ax.axvline(t_event_ms, color='r', ls='--', lw=0.8)
     ax.axhline(0, color='k', lw=0.4)
-    ax.set_title('Speed deviation Δω [% pu]')
-    ax.set_xlabel('Time [ms]'); ax.set_ylabel('Δω [% pu]')
+    ax.set_title('Speed deviation Δω [rad/s]')
+    ax.set_xlabel('Time [ms]'); ax.set_ylabel('Δω [rad/s]')
     ax.grid(True, alpha=0.4)
 
     # (0,2) T_e vs T_m
@@ -198,13 +225,7 @@ def plot_gen_scenario(sim, gen, data):
 
 
 def save_results_mat(data, filename=MAT_FILENAME, stride=MAT_STRIDE):
-    """결과 dict을 MATLAB .mat으로 저장.
-
-    MATLAB 측:
-        load('emt_results.mat');
-        plot(time, rad2deg(delta));
-        plot(time, V_bus2');   % 3 × n 행렬, 각 행이 phase a/b/c
-    """
+    """결과 dict을 MATLAB .mat으로 저장."""
     sl = slice(None, None, stride)
     out = {
         'time':     data['time'][sl],
@@ -228,12 +249,15 @@ def save_results_mat(data, filename=MAT_FILENAME, stride=MAT_STRIDE):
 def _plot_v_abc(ax, sim, bus_id, V_history, t_ms, t_event_ms, title):
     """공통 V_abc plot helper (전체 구간)."""
     slot = sim.bus_manager.slot_of(bus_id)
+    v_multiplier = V_BASE_KV if PLOT_IN_KV else 1.0
+    unit_str = 'kV (L-N Peak)' if PLOT_IN_KV else 'pu'
+    
     for ph, lab, c in zip(range(3), ['A','B','C'], ['tab:red','tab:green','tab:blue']):
-        ax.plot(t_ms, V_history[slot*3+ph, :],
+        ax.plot(t_ms, V_history[slot*3+ph, :] * v_multiplier,
                 label=f'Phase {lab}', color=c, lw=0.6)
     ax.axvline(t_event_ms, color='gray', ls='--', lw=0.8)
     ax.set_title(title)
-    ax.set_xlabel('Time [ms]'); ax.set_ylabel('V [pu]')
+    ax.set_xlabel('Time [ms]'); ax.set_ylabel(f'V [{unit_str}]')
     ax.legend(loc='best', fontsize=8); ax.grid(True, alpha=0.4)
 
 
