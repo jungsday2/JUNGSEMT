@@ -13,10 +13,11 @@ P, Q (per-unit, 3-phase total)와 정격 전압 V_nom으로부터 등가 임피�
 각 가지는 사다리꼴(Trapezoidal)로 이산화되어 G에 stamping되고, 이력 전류원으로
 관리된다. 3상 평형 가정으로 상별 스칼라 식을 그대로 적용한다.
 
-수치 댐핑 (R-L 가지에 한해 적용):
-    params['damping_L'] = α (>0) → R_dL = (2L/Δt) / α 가 R-L 가지에 병렬
-    G에 1/R_dL 만 추가되며 I_hist는 G_pure 기준 (댐핑 저항은 이력 없음).
-    분기 전류 상태는 인덕터 분기 i_RL만 추적한다.
+수치 댐핑 (R-L 가지에 한해 적용, ParaEMT 방식):
+    params['damping_L'] = β (>0) → Rp = 2L/(β·Δt) 가 L에만 병렬 (R은 항상 직렬)
+    토폴로지: Vbus → R → (L ‖ Rp) → GND
+    G_eq = (α+β)/Δ, icf = (1-R(α-β))/Δ, Gv1 = (α-β)/Δ, Δ = 1+R(α+β), α = Δt/(2L)
+    분기 전류 상태는 전체 전류 i_total = i_L + i_Rp 추적.
     R-C 가지는 R 자체가 댐핑 역할을 겸하므로 추가 옵션 없음.
 
 NOTE:
@@ -44,7 +45,8 @@ class Load(BaseComponent):
         Q = params['Q']                       # 3상 총 무효전력 [p.u.] (유도성: +)
         V_nom = params.get('V_nom', 1.0)      # 정격 전압 [p.u.]
         f_sys = params.get('f_sys', 60.0)     # 계통 주파수 [Hz]
-        damping_L = params.get('damping_L', 0.0)  # 인덕터 병렬 댐핑 계수 (RL 가지에만)
+        damping_L = params.get('damping_L', 0.15)  # 인덕터 병렬 댐핑 계수 (RL 가지에만)
+        damping_C = params.get('damping_C', 0.0)  # 션트 병렬 댐핑 계수 (RC 가지에만)
         omega = 2.0 * np.pi * f_sys
 
         if P == 0.0 and Q == 0.0:
@@ -66,17 +68,17 @@ class Load(BaseComponent):
             # 이력 상태 없음
 
         elif X > 0:
-            # ===== R-L 직렬 (with optional R_dL ‖) =====
+            # ===== R - (L‖Rp) : ParaEMT 방식, R은 항상 직렬, Rp는 L에만 병렬 =====
             self.kind = 'RL'
             self.L = X / omega
-            self.G_eq_pure = 1.0 / (R + 2.0 * self.L / dt)
-            self.alpha = (2.0 * self.L / dt - R) / (2.0 * self.L / dt + R)
-            # 댐핑 저항 1/R_dL (위상자 해석에서도 동일 사용)
-            self.G_RdL = damping_L * dt / (2.0 * self.L) if damping_L > 0 else 0.0
-            # G_eff = G_pure + 1/R_dL (R_dL이 R-L 가지에 병렬)
-            self.G_eq = self.G_eq_pure + self.G_RdL
-            # 분기 전류 / 단자 전압 이력 (i_branch_prev = i_RL, 인덕터 분기만)
-            self.i_branch_prev = np.zeros(n)
+            alpha = dt / (2.0 * self.L)          # = dt/(2L)
+            beta  = damping_L * alpha             # = 1/Rp
+            Delta = 1.0 + R * (alpha + beta)
+            self.G_eq = (alpha + beta) / Delta
+            self.icf  = (1.0 - R * (alpha - beta)) / Delta   # 이력 전류 계수
+            self.Gv1  = (alpha - beta) / Delta                # 이력 전압 계수
+            # 전체 분기 전류 이력 (i_L + i_Rp 합산)과 단자 전압 이력
+            self.i_total_prev = np.zeros(n)
             self.v_prev = np.zeros(n)
 
         else:
@@ -90,6 +92,9 @@ class Load(BaseComponent):
             self.v_C_prev = np.zeros(n)
 
         self.damping_L = damping_L
+
+        # PF 위상자 전압 (stamp_I_phasor에서 사용; initialize_states/update_phasor_voltage에서 갱신)
+        self.V_term_p = 1.0 + 0j
 
     # ============================================================
     # 운전점 변경 (mid-simulation 외란용)
@@ -136,10 +141,12 @@ class Load(BaseComponent):
             self.G_eq = self.G_eq_pure
         elif self.kind == 'RL':
             self.L = X / omega
-            self.G_eq_pure = 1.0 / (R + 2.0 * self.L / dt)
-            self.alpha = (2.0 * self.L / dt - R) / (2.0 * self.L / dt + R)
-            self.G_RdL = damping_L * dt / (2.0 * self.L) if damping_L > 0 else 0.0
-            self.G_eq = self.G_eq_pure + self.G_RdL
+            alpha = dt / (2.0 * self.L)
+            beta  = damping_L * alpha
+            Delta = 1.0 + R * (alpha + beta)
+            self.G_eq = (alpha + beta) / Delta
+            self.icf  = (1.0 - R * (alpha - beta)) / Delta
+            self.Gv1  = (alpha - beta) / Delta
         else:  # 'RC'
             self.C = -1.0 / (omega * X)
             self.G_eq = 1.0 / (R + dt / (2.0 * self.C))
@@ -181,10 +188,10 @@ class Load(BaseComponent):
         I_hist = self._compute_I_hist()
 
         if self.kind == 'RL':
-            # i_RL (인덕터 분기, G_pure로 계산: 댐핑 저항 분은 별도 v/R_dL 흐름)
-            i_curr = self.G_eq_pure * V + I_hist
+            # i_total = i_L + i_Rp (전체 분기 전류 추적)
+            i_total = self.G_eq * V + I_hist
             self.v_prev = V.copy()
-            self.i_branch_prev = i_curr
+            self.i_total_prev = i_total
         else:  # 'RC'
             i_curr = self.G_eq * V + I_hist
             v_C_curr = self.v_C_prev + (self.dt / (2.0 * self.C)) * (
@@ -198,8 +205,8 @@ class Load(BaseComponent):
     # ------------------------------------------------------------
     def _compute_I_hist(self):
         if self.kind == 'RL':
-            # I_hist = G_pure · v(t-Δt) + α · i_RL(t-Δt)   (댐핑 저항은 이력 없음)
-            return self.G_eq_pure * self.v_prev + self.alpha * self.i_branch_prev
+            # I_hist = icf · i_total(t-Δt) + Gv1 · v(t-Δt)  (ParaEMT R-(L‖Rp) 공식)
+            return self.icf * self.i_total_prev + self.Gv1 * self.v_prev
         else:  # 'RC'
             # I_hist = -G_eq · (v_C(t-Δt) + (Δt/(2C))·i(t-Δt))
             return -self.G_eq * (
@@ -210,19 +217,29 @@ class Load(BaseComponent):
     # 위상자 정상상태 (bumpless start)
     # ============================================================
     def stamp_Y_phasor(self, Y_matrix, omega):
-        """60 Hz에서의 등가 admittance를 모선 대각에 누적."""
-        if self.kind == 'R':
-            Y_load = 1.0 / self.R
-        elif self.kind == 'RL':
-            # (R-L) ‖ R_dL
-            Y_load = 1.0 / (self.R + 1j * omega * self.L) + self.G_RdL
-        else:  # 'RC'
-            # R + 1/(jωC) 직렬
-            Y_load = 1.0 / (self.R + 1.0 / (1j * omega * self.C))
+        """Const-Z: 부하 어드미턴스를 Y 행렬에 직접 stamping (PSCAD R-L 직결과 동일 특성)."""
+        V_nom = self.params.get('V_nom', 1.0)
+        P     = self.params['P']
+        Q     = self.params['Q']
+        Y_load = (P - 1j * Q) / (V_nom ** 2)
         Y_matrix[self._slot, self._slot] += Y_load
+        # [Const-PQ] pass  # 부하는 PQ 주입으로 표현 — Y 행렬에 기여 없음
+
+    def stamp_I_phasor(self, I_vector, omega):
+        pass  # Const-Z: 어드미턴스가 Y 행렬에 반영됨 — 별도 전류 주입 없음
+        # [Const-PQ] I_load = (P - jQ) / conj(V)  (부하는 흡수 → 음의 주입)
+        # P = self.params['P']
+        # Q = self.params['Q']
+        # I_load = (P - 1j * Q) / np.conj(self.V_term_p)
+        # I_vector[self._slot] -= I_load
+
+    def update_phasor_voltage(self, V_phasor):
+        """NR 반복 중 단자 전압 위상자만 갱신 (EMT 상태 보존)."""
+        self.V_term_p = V_phasor[self._slot]
 
     def initialize_states(self, V_phasor, omega, dt):
         """위상자 V_phasor로부터 분기 전류·v_C·v_prev를 t=-Δt 시점 인스턴스 값으로 세팅."""
+        self.V_term_p = V_phasor[self._slot]  # stamp_I_phasor용 동기화
         if self.kind == 'R':
             return  # 내부 상태 없음
 
@@ -231,10 +248,10 @@ class Load(BaseComponent):
         t_prev = -dt
 
         if self.kind == 'RL':
-            # 인덕터 분기 위상자 (R_dL 가지 전류는 이력 없음 → 추적 안 함)
+            # Rp >> ωL 이므로 정상상태 i_total ≈ i_L = V/(R+jωL)
             I_p = V_p / (self.R + 1j * omega * self.L)
-            self.v_prev        = phasor_to_3phase_at(V_p, omega, t_prev, n)
-            self.i_branch_prev = phasor_to_3phase_at(I_p, omega, t_prev, n)
+            self.v_prev       = phasor_to_3phase_at(V_p, omega, t_prev, n)
+            self.i_total_prev = phasor_to_3phase_at(I_p, omega, t_prev, n)
         else:  # 'RC'
             # R-C 직렬: 분기 전류 + 콘덴서 전압
             Z = self.R + 1.0 / (1j * omega * self.C)

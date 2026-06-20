@@ -5,9 +5,9 @@ EMT_3bus 패키지: 3 모선 EMT 시뮬레이션을 위한 객체별 분리 구�
 """
 
 from .supEMT import BaseComponent, BusManager
-from .generator import Generator
+from .generator import Generator, TGOV1, HYGOV, SEXS
 from .load import Load
-from .simulator import ParaEMTSimulator
+from .simulator import EMTSimulator
 from .transmission_line import (
     TransmissionLine,
     LINE_DATA_3BUS,
@@ -19,8 +19,11 @@ __all__ = [
     "BaseComponent",
     "BusManager",
     "Generator",
+    "TGOV1",
+    "HYGOV",
+    "SEXS",
     "Load",
-    "ParaEMTSimulator",
+    "EMTSimulator",
     "TransmissionLine",
     "LINE_DATA_3BUS",
     "build_3bus_lines",

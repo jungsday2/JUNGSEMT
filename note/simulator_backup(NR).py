@@ -3,7 +3,7 @@
 ParaEMTSimulator: EMT 메인 시뮬레이터.
 
 라이프사이클:
-    1) sim = EMTSimulator(dt, t_end)
+    1) sim = ParaEMTSimulator(dt, t_end)
     2) sim.add(component)            # 컴포넌트 등록 (BusManager는 sim.bus_manager 공유)
     3) sim.build()                   # G 행렬 조립 + LU 분해
     4) sim.initialize(V_initial)     # bumpless start (선택)
@@ -22,7 +22,7 @@ from scipy.sparse import csc_matrix
 from .supEMT import phasor_to_3phase_at, BusManager
 
 
-class EMTSimulator:
+class ParaEMTSimulator:
     def __init__(self, dt, t_end, phases=3):
         self.dt = dt
         self.t_end = t_end
@@ -86,24 +86,21 @@ class EMTSimulator:
     # ------------------------------------------------------------
     # 초기화 (bumpless start)
     # ------------------------------------------------------------
-    def initialize(self, omega=None, V_phasor=None, max_iter=20, tol=1e-8, verbose=False,
-                   slack_bus=None, V_slack=(1.0+0j)):
+    def initialize(self, omega=None, V_phasor=None, max_iter=20, tol=1e-8, verbose=False):
         """위상자 정상상태 해석으로 컴포넌트 내부 상태를 세팅 (bumpless start).
 
         반복(iterative) 풀이:
             1. Y matrix 빌드 (한 번만, 변하지 않음)
             2. 컴포넌트의 stamp_I_phasor + initialize_states를 사이클로 호출
+               (능동 소자(발전기)의 e''_phasor가 회전자 상태에 의존하므로 수렴 필요)
             3. V_phasor 변화량 < tol 또는 max_iter 도달 시 종료
 
         Args:
-            omega:     정상상태 각주파수 [rad/s]. None이면 2π·60.
-            V_phasor:  사용자가 직접 모선 위상자를 주면 반복 없이 단일 패스.
-            max_iter:  최대 반복
-            tol:       수렴 판정 (max|ΔV_phasor|)
-            verbose:   반복 진행 출력
-            slack_bus: 기준 버스 ID. 지정하면 해당 버스 전압을 V_slack으로 고정하여
-                       NR 야코비안의 각도 특이성을 제거한다 (무한모선 없는 계통에서 필수).
-            V_slack:   slack_bus에 고정할 전압 위상자 (default 1.0+0j).
+            omega:    정상상태 각주파수 [rad/s]. None이면 2π·60.
+            V_phasor: 사용자가 직접 모선 위상자를 주면 반복 없이 단일 패스.
+            max_iter: 최대 반복 (선형 부하·전원 + 발전기로 보통 5-10회 수렴)
+            tol:      수렴 판정 (max|ΔV_phasor|)
+            verbose:  반복 진행 출력
         """
         if self._LU is None:
             raise RuntimeError("Call build() before initialize().")
@@ -114,66 +111,49 @@ class EMTSimulator:
         N_buses = self.bus_manager.num_buses
         n_phases = self.bus_manager.phases
 
-        slack_slot = None
-        if slack_bus is not None:
-            slack_slot = self.bus_manager.slot_of(slack_bus)
-
         if V_phasor is None:
-            # Y 행렬은 컴포넌트 파라미터에만 의존 → 한 번만 빌드ㄹ
+            # Y 행렬은 컴포넌트 파라미터에만 의존 → 한 번만 빌드
             Y = np.zeros((N_buses, N_buses), dtype=complex)
             for comp in self.components:
                 comp.stamp_Y_phasor(Y, omega)
 
             # 잔차(Residual) 계산 헬퍼 함수
-            # update_phasor_voltage: 경량 V 갱신만 (EMT 상태 보존)
-            # initialize_states는 NR 수렴 후 1회만 호출
             def eval_residual(V_cplx):
                 for comp in self.components:
-                    comp.update_phasor_voltage(V_cplx)
+                    comp.initialize_states(V_cplx, omega, self.dt)
                 I_ph = np.zeros(N_buses, dtype=complex)
                 for comp in self.components:
                     comp.stamp_I_phasor(I_ph, omega)
                 return Y @ V_cplx - I_ph
 
-            # Flat Start (1+j0). slack_bus는 처음부터 V_slack으로 고정
+            # 반복 풀이 (Newton-Raphson)
+            # NR은 V=0에서 출발하면 발전기(I = S*/V*) 연산 시 0으로 나누게 되므로 Flat Start(1+j0) 사용
             V_phasor = np.ones(N_buses, dtype=complex)
-            if slack_slot is not None:
-                V_phasor[slack_slot] = V_slack
-
             for it in range(max_iter):
                 F0 = eval_residual(V_phasor)
                 F0_vec = np.concatenate([F0.real, F0.imag])
 
                 # 수치적 야코비안(Numerical Jacobian) 구성
+                # (각 컴포넌트에 stamp_J_phasor를 추가하는 보일러플레이트를 피하기 위해)
                 eps = 1e-6
                 J = np.zeros((2 * N_buses, 2 * N_buses))
                 for i in range(N_buses):
+                    # Real 축 미분
                     V_pert = V_phasor.copy()
                     V_pert[i] += eps
                     F_pert = eval_residual(V_pert)
                     J[:, i] = (np.concatenate([F_pert.real, F_pert.imag]) - F0_vec) / eps
 
+                    # Imag 축 미분
                     V_pert = V_phasor.copy()
                     V_pert[i] += 1j * eps
                     F_pert = eval_residual(V_pert)
                     J[:, N_buses + i] = (np.concatenate([F_pert.real, F_pert.imag]) - F0_vec) / eps
 
-                # slack 버스 행을 항등식으로 교체 → dV[slack]=0 강제
-                if slack_slot is not None:
-                    for row in (slack_slot, N_buses + slack_slot):
-                        J[row, :] = 0.0
-                        J[row, row] = 1.0
-                    F0_vec[slack_slot] = 0.0
-                    F0_vec[N_buses + slack_slot] = 0.0
-
                 # 풀이 및 업데이트
                 dX = np.linalg.solve(J, -F0_vec)
                 dV = dX[:N_buses] + 1j * dX[N_buses:]
                 V_phasor += dV
-
-                # slack 전압 복원 (수치 오차 누적 방지)
-                if slack_slot is not None:
-                    V_phasor[slack_slot] = V_slack
 
                 diff = float(np.max(np.abs(dV)))
                 if verbose:

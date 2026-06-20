@@ -22,7 +22,7 @@ LINE_DATA_3BUS = {
 
 class TransmissionLine(BaseComponent):
     def __init__(self, bus_from, bus_to, R, L, C, dt, bus_manager,
-                 damping_L=0.0, damping_C=0.0):
+                 damping_L=0.15, damping_C=0.75):
        
         self.bus_from = bus_from
         self.bus_to = bus_to
@@ -39,41 +39,31 @@ class TransmissionLine(BaseComponent):
         self.damping_L = damping_L
         self.damping_C = damping_C
 
-        # ---- R-L 직렬 사다리꼴 계수 (G_pure는 I_hist 계산에 사용) ----
-        self.G_series_pure = 1.0 / (R + 2.0 * L / dt)
-        self.alpha = (2.0 * L / dt - R) / (2.0 * L / dt + R)
-        # 댐핑 저항 1/R_dL 분 (위상자 해석에서도 동일하게 사용)
-        self.G_RdL = damping_L * dt / (2.0 * L) if damping_L > 0 else 0.0
-        # G_eff = G_pure + 1/R_dL (R_dL이 R-L 가지에 병렬)
-        self.G_series = self.G_series_pure + self.G_RdL
+        # ---- R-L 직렬 : R-(L‖Rp) ParaEMT 방식 ----
+        alpha_L = dt / (2.0 * L)
+        beta_L  = damping_L * alpha_L        # = 1/Rp
+        Delta_L = 1.0 + R * (alpha_L + beta_L)
+        self.G_series = (alpha_L + beta_L) / Delta_L
+        self.icf_L    = (1.0 - R * (alpha_L - beta_L)) / Delta_L
+        self.Gv1_L    = (alpha_L - beta_L) / Delta_L
 
         # ---- R-C 직렬 션트 사다리꼴 계수 (R_dC=0이면 순수 C와 동일) ----
         # G_shunt = 1 / (R_dC + Δt/C), R_dC = damping_C · Δt/C
         # → G_shunt = 1 / ((1 + damping_C) · Δt/C) = C / ((1 + damping_C) · Δt)
-        self.R_dC = damping_C * dt / C if damping_C > 0 else 0.0
-        self.G_shunt = C / ((1.0 + damping_C) * dt)
-        self.dt_over_C = dt / C    # 자주 쓰는 계수
+        self._has_shunt = C > 0.0
+        self.R_dC = damping_C * dt / C if (damping_C > 0 and C > 0.0) else 0.0
+        self.G_shunt = C / ((1.0 + damping_C) * dt) if C > 0.0 else 0.0
+        self.dt_over_C = dt / C if C > 0.0 else 0.0
 
         # ---- 분기 전류 / 단자 전압 이력 ----
         n = self._phases
-        self.i_series_prev      = np.zeros(n)   # 인덕터 분기 전류 i_RL (총 전류 아님!)
+        self.i_series_prev      = np.zeros(n)   # 전체 직렬 분기 전류 (i_L + i_Rp)
         self.i_shunt_from_prev  = np.zeros(n)   # 션트 R-C 직렬 분기 전류
         self.i_shunt_to_prev    = np.zeros(n)
         self.v_from_prev        = np.zeros(n)   # 모선 전압 (R-L 이력용)
         self.v_to_prev          = np.zeros(n)
         self.v_C_from_prev      = np.zeros(n)   # 콘덴서 단자 전압 (R-C 이력용)
         self.v_C_to_prev        = np.zeros(n)
-
-    # ------------------------------------------------------------
-    # 라인 활성/비활성 토글 (트립 / 재투입 메커니즘)
-    # ------------------------------------------------------------
-    def set_active(self, active):
-        """라인의 활성 상태를 토글한다. False 시 모든 stamping이 no-op.
-
-        호출 후 simulator.rebuild_G() 필수 (G 행렬에서 라인 기여분 제거 위해).
-        내부 이력은 보존됨 — 추후 재투입 시 활용 가능 (현재는 사용 안 함).
-        """
-        self.active = bool(active)
 
     # ------------------------------------------------------------
     # G 행렬 stamping (Modified Nodal Analysis)
@@ -107,7 +97,7 @@ class TransmissionLine(BaseComponent):
         if not self.active:
             return
         v_diff_prev = self.v_from_prev - self.v_to_prev
-        I_hist_series = self.G_series_pure * v_diff_prev + self.alpha * self.i_series_prev
+        I_hist_series = self.icf_L * self.i_series_prev + self.Gv1_L * v_diff_prev
 
         I_hist_shunt_from = -self.G_shunt * (
             self.v_C_from_prev + self.dt_over_C * self.i_shunt_from_prev
@@ -136,10 +126,10 @@ class TransmissionLine(BaseComponent):
         V_from = V_nodes[i0:i0+n]
         V_to   = V_nodes[j0:j0+n]
 
-        # 인덕터 분기 전류 i_RL (G_pure로 계산: 댐핑 저항 분은 별도 v/R_dL 흐름)
+        # 직렬 분기 전체 전류 (i_L + i_Rp)
         v_diff_prev   = self.v_from_prev - self.v_to_prev
-        I_hist_series = self.G_series_pure * v_diff_prev + self.alpha * self.i_series_prev
-        i_series_curr = self.G_series_pure * (V_from - V_to) + I_hist_series
+        I_hist_series = self.icf_L * self.i_series_prev + self.Gv1_L * v_diff_prev
+        i_series_curr = self.G_series * (V_from - V_to) + I_hist_series
 
         # 션트 R-C 직렬 분기 전류
         I_hist_shunt_from = -self.G_shunt * (
@@ -179,9 +169,13 @@ class TransmissionLine(BaseComponent):
         """
         if not self.active:
             return
-        Y_series = 1.0 / (self.R + 1j * omega * self.L) + self.G_RdL
-        Z_C_half = 2.0 / (1j * omega * self.C)
-        Y_shunt = 1.0 / (self.R_dC + Z_C_half)
+        # R-(L‖Rp) : Rp >> ωL 이므로 위상자는 1/(R+jωL) 로 근사 (오차 < 0.2%)
+        Y_series = 1.0 / (self.R + 1j * omega * self.L)
+        if self._has_shunt:
+            Z_C_half = 2.0 / (1j * omega * self.C)
+            Y_shunt = 1.0 / (self.R_dC + Z_C_half)
+        else:
+            Y_shunt = 0.0
 
         f, t = self._from_slot, self._to_slot
         Y_matrix[f, f] += Y_series + Y_shunt
@@ -198,20 +192,23 @@ class TransmissionLine(BaseComponent):
         V_to_p   = V_phasor[self._to_slot]
         V_diff_p = V_from_p - V_to_p
 
-        # 인덕터 분기(R-L 직렬) 위상자: i_RL = V_diff / (R + jωL)
-        # ※ 댐핑 저항 R_dL 가지의 전류는 v(t)에 비례할 뿐 이력 무관 → 추적 안 함
+        # 직렬 분기 위상자 i_total ≈ i_RL = V_diff/(R+jωL)  (Rp >> ωL)
         Z_RL = self.R + 1j * omega * self.L
         I_RL_p = V_diff_p / Z_RL
 
-        # 션트 R-C 직렬 분기 위상자
-        Z_C_half = 2.0 / (1j * omega * self.C)
-        Z_shunt = self.R_dC + Z_C_half
-        I_shunt_from_p = V_from_p / Z_shunt
-        I_shunt_to_p   = V_to_p   / Z_shunt
-
-        # 콘덴서 단자 전압 위상자: V_C = V_bus - R_dC · I_shunt
-        V_C_from_p = V_from_p - self.R_dC * I_shunt_from_p
-        V_C_to_p   = V_to_p   - self.R_dC * I_shunt_to_p
+        # 션트 R-C 직렬 분기 위상자 (C=0이면 shunt 없음)
+        if self._has_shunt:
+            Z_C_half = 2.0 / (1j * omega * self.C)
+            Z_shunt = self.R_dC + Z_C_half
+            I_shunt_from_p = V_from_p / Z_shunt
+            I_shunt_to_p   = V_to_p   / Z_shunt
+            V_C_from_p = V_from_p - self.R_dC * I_shunt_from_p
+            V_C_to_p   = V_to_p   - self.R_dC * I_shunt_to_p
+        else:
+            I_shunt_from_p = 0.0 + 0.0j
+            I_shunt_to_p   = 0.0 + 0.0j
+            V_C_from_p     = 0.0 + 0.0j
+            V_C_to_p       = 0.0 + 0.0j
 
         # 위상자 → t=-Δt 인스턴스 값 (3상)
         t_prev = -dt
@@ -258,17 +255,15 @@ def build_3bus_lines(dt, bus_manager, line_data=None,
 TransmissionLine: 송전선 lumped pi-model + 사다리꼴 이산화 (수치 댐핑 옵션 포함).
 
 토폴로지:
-    bus_from --(R_dC + C/2 ground shunt)--[R--L 직렬 (with optional R_dL ‖)]--(R_dC + C/2 ground shunt)-- bus_to
+    bus_from --(Rs_C + C/2 ground shunt)--[R -- (L ‖ Rp) 직렬]--(Rs_C + C/2 ground shunt)-- bus_to
 
 Dommel 사다리꼴(Trapezoidal) 이산화:
-    R-L 직렬 :  i_RL(t)    = G_RL_pure · v_ij(t) + I_hist_RL
-                G_RL_pure  = 1 / (R + 2L/Δt)
-                α          = (2L/Δt - R) / (2L/Δt + R)
-                I_hist_RL  = G_RL_pure · v_ij(t-Δt) + α · i_RL(t-Δt)
-                ※ damping_L>0 이면 R-L 가지에 R_dL이 병렬로 추가되어
-                  G에 stamping되는 등가 컨덕턴스만 G_RL_pure + 1/R_dL 로 증가하고,
-                  I_hist는 그대로 (댐핑 저항은 순수 저항이라 이력 없음).
-                  분기 전류 상태는 인덕터 분기 i_RL만 추적한다.
+    R-L 직렬 :  R-(L‖Rp) ParaEMT 방식. α=Δt/2L, β=damping_L·α=1/Rp, Δ=1+R(α+β)
+                G_series = (α+β)/Δ
+                icf_L    = (1-R(α-β))/Δ
+                Gv1_L    = (α-β)/Δ
+                I_hist   = icf_L·i_total(t-Δt) + Gv1_L·v_ij(t-Δt)
+                i_total  = i_L + i_Rp  (전체 분기 전류 추적)
 
     R-C 직렬 :  i_C(t)     = G_RC · v_bus(t) + I_hist_RC
                 G_RC       = 1 / (R_dC + Δt/C)        (C는 라인 총 C, C/2가 한 끝에)

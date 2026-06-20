@@ -62,8 +62,32 @@ initialize_states(V_phasor, ω, dt)  → 위상자에서 t=-Δt 인스턴스 값
    → Stage 6에서 `initialize_states`가 ψ''를 stator algebraic으로 backsolve하고 E_fd를 자동 override해서 일관성 확보. **사용자 입력 E_fd값은 무시됨**.
 2. **stator transient 무시** (표준 GENROU). 60Hz 근처는 정확하지만 수 kHz 트랜지언트는 부정확.
 3. **Saturation off**, **AVR/Governor 없음** — E_fd, T_m 상수.
-4. **명시적 Euler** 적분 (rotor 6 ODE). 작은 잔류 drift 가능 (2초당 ~1e-3 수준).
+4. ~~**명시적 Euler** 적분 (rotor 6 ODE). 작은 잔류 drift 가능 (2초당 ~1e-3 수준).~~ → **G_equiv 방식으로 해결** (아래 참고). drift 1.2e-5 rad 이하.
 5. **부하는 Constant Z만**. Constant PQ나 NR PF는 미구현.
+
+## Bumpless Start — G_equiv 방식 (2026-06-08 개선 완료)
+
+**문제**: phasor NR이 복소수 Y_gen = 1/(Ra + jX''_d) 을 사용했으나, EMT 스텝은 Schur-reduced 실수 G_av = 1/R_av 를 사용 → 두 등가회로 불일치 → pre-event drift 2.5e-3 rad.
+
+**해결**: `stamp_Y_phasor` / `stamp_I_phasor`를 EMT G 행렬과 동일한 G_av 기반으로 변경.
+
+| 항목 | 수정 전 | 수정 후 |
+|---|---|---|
+| `stamp_Y_phasor` | `Y_gen = 1/(Ra+jX''_d)` (복소) | `G_av = 1/R_av` (실수, alpha_mac 포함) |
+| `stamp_I_phasor` | `Y_gen × e''_phasor` | `I_gen + G_av × V` (G_av 항 소거) |
+| P_op 계산 | `P_op = T_m` | `P_terminal = T_m - Ra·\|I_gen\|²` (Ra·I² 보정) |
+
+**결과**:
+
+| 지표 | 수정 전 | 수정 후 |
+|---|---|---|
+| pre-event δ drift | 2.5e-3 rad/s | **1.2e-5 rad/s** |
+| T_e_init | 0.803 (T_m 초과) | **0.8000** (T_m 정확 일치) |
+| NR 수렴 | 5회 | **3회** |
+
+**핵심 원리**: G_av(Schur) = (Rd_red + Rq_red)/2 ≈ 24.18 pu → G_av ≈ 0.041 pu. Phasor NR의 Y_gen(복소 −j4.35)과 전혀 다른 값이었음. alpha_mac = 99/101 (수치 댐핑)이 포함된 실수 컨덕턴스를 사용해야 EMT와 일관성 확보.
+
+---
 
 ## Stage 진행 (모두 완료, 검증됨)
 
@@ -78,25 +102,31 @@ initialize_states(V_phasor, ω, dt)  → 위상자에서 t=-Δt 인스턴스 값
 | **A** | main_emt_3bus.py: gen 추가 + 6패널 플롯 | 깨끗한 60Hz 사인파, ψ''/δ 정상 일정 |
 | **B** | 외란 응답: 부하 step + swing 시각화 | f_n=1.78 Hz (이론 1.77 Hz와 0.5% 일치), ζ=0.135 (댐퍼 권선 효과) |
 
-**main_emt_3bus.py 현재 구성** (Stage B — 외란 응답, 2× 분기):
-- bus 1 = VoltageSource (slack, R_int=0.001)
-- bus 2 = `SOURCE_TYPE` 분기:
-  - `'gen'` — Generator (T_m=0.8, Q_op=0.2, D=2)
-  - `'vs'` — VoltageSource (V_mag=1.010, V_angle_deg=0.83° → gen 정상상태 매칭, R_int=0.005)
-- bus 3 = Load (P=0.8, Q=0.4)
-- 외란 `SCENARIO` 분기:
-  - `'load_step'` — t=T_EVENT에 P 0.8→**8.0** (10× 시나리오), Q 0.4→4.0
-  - `'line_trip'` — t=T_EVENT에 라인 2-3 영구 개방
-- T_END=5초, T_EVENT=0.5초
-- plot 분기: `plot_gen_scenario()` (회전자 상태) / `plot_vs_scenario()` (V envelope)
+**main_emt_3bus.py 현재 구성** (PSCAD 비교 기준):
+- bus 1 = VoltageSource (slack, V_mag=1.0, V_angle=0°, R_int=0.00104, **cos(ωt) 기준**)
+- bus 2 = Generator (T_m=0.8, E_fd=2.0, Q_op=0.2, D=0.0)
+- bus 3 = Load (P=0.8, Q=0.4, Constant-Z)
+- `SCENARIO`: `'load_step'` / `'line_trip'` / `'load_step_temp'` / `'line_trip_temp'`
+- T_END=20s, T_EVENT=10s, DT=50µs
+- `TEMP_DURATION = 20×DT` (temp 시나리오 복귀 시간)
 
-**main 구조** (헬퍼 함수 분리):
+**main 구조**:
 ```
-build_simulator() → sim, gen|None, line_2_3, load  (+ sim.build() 자동)
-apply_event()     → SCENARIO에 따라 외란 적용 + rebuild_G
-run_simulation()  → 수동 step loop (gen 있으면 회전자 상태도 기록)
-plot_gen_scenario() / plot_vs_scenario()
+build_simulator()  → sim, gen, line_2_3, load  (+ sim.build() 자동)
+apply_event()      → SCENARIO에 따라 외란 적용 + rebuild_G
+clear_event()      → temp 시나리오 복귀 + rebuild_G
+run_simulation()   → 수동 step loop, dict 반환
+plot_gen_scenario() → 2×3 서브플롯 (Δδ / ω / Te / ψ'' / V_abc×2)
+save_results_mat() → .mat 저장 (delta_dev 포함)
 ```
+
+**플롯 컨벤션** (PSCAD 비교 기준, 2026-06-08 정리):
+- (0,0) **Δδ = δ(t) − δ(0)** [rad] — PSCAD rotor angle과 직접 비교 가능
+- (0,1) **ω** [rad/s] = (omega_dev + 1) × 2π×60
+- (0,2) Te [pu] vs T_m
+- (1,0) ψ''_d, ψ''_q [pu]
+- (1,1) Bus 3 V_abc, (1,2) Bus 2 V_abc
+- **시간축**: s (초), **y축**: plain 숫자 (scientific notation 제거)
 
 **외란 처리 메커니즘**:
 - `Load.set_operating_point(P, Q)` — 운전점 변경 (이력 보존, 계수만 재계산, kind 변경 불가)
@@ -163,6 +193,28 @@ plot_gen_scenario() / plot_vs_scenario()
 - $R_d^C$ + capacitor 직렬: `damping_C = β` → $R_d = \beta \cdot \Delta t/C$
 - 권장 0~0.1, 기본 0 (꺼짐)
 
+## PSCAD 비교 — 각도 컨벤션 (2026-06-08 분석 완료)
+
+**핵심 차이**:
+
+| 항목 | 우리 코드 | PSCAD |
+|---|---|---|
+| rotor angle 출력 | 절대값 δ = −0.7602 rad | **Δδ = δ(t) − δ(0)** (항상 0 시작) |
+| 전압 파형 기준 | **cos(ωt)** (V_a(0)=1.0, 피크 시작) | **sin(ωt)** (V_a(0)=0, 영교차 시작) |
+| V_abc 위상차 | — | **90° = 4.17 ms** 차이 |
+
+**PSCAD Wang 공식**: `Wang = θ_V_terminal + δ_0 + ∫(ω_pu − 1) dt`
+- PSCAD가 플롯에 출력하는 "rotor angle" = 마지막 항 `∫(ω_pu − 1) dt` = Δδ
+- cos/sin 기준 차이로 절대 δ값은 π/2 offset 있음, **Δδ 비교에서는 소거됨**
+
+**비교 방법**:
+- δ 비교: `delta_dev = delta - delta[0]` (코드에 적용됨, mat 저장에도 포함)
+- V_abc 비교: PSCAD 파형을 4.17ms (= T/4) 시프트하거나 우리 코드 V_angle_deg = −90° 설정
+
+**Rotor Mechanical Angle** (PSCAD 별도 출력): 0~2π sawtooth — 물리적 로터 위치, swing 비교와 무관.
+
+---
+
 ## PSCAD 환산 (Kundur 555 MVA, 24 kV base)
 
 | 기준 | 값 |
@@ -191,18 +243,18 @@ plot_gen_scenario() / plot_vs_scenario()
 |---|---|
 | ~~A~~ | ~~main_emt_3bus.py에 발전기 + 시각화로 깨끗한 60Hz 파형 확인~~ ✓ 완료 |
 | ~~B~~ | ~~외란 응답 (부하 step) → swing 응답~~ ✓ 완료 (이론과 0.5% 일치) |
-| ~~B+~~ | ~~SOURCE_TYPE 분기 (gen vs vs) + 10× 부하 시나리오 + PV curve 분석~~ ✓ 완료 |
-| **PSCAD 비교** | 환산값 준비됨 (위 섹션). PSCAD에서 동일 회로 구성 후 V, δ, swing freq 비교 |
+| ~~B+~~ | ~~SOURCE_TYPE 분기 + 10× 부하 시나리오~~ ✓ 완료 |
+| ~~Bumpless~~ | ~~G_equiv 방식 bumpless start~~ ✓ 완료 (drift 2.5e-3 → 1.2e-5, T_e=T_m) |
+| ~~PSCAD 컨벤션~~ | ~~각도/각속도 컨벤션 분석~~ ✓ 완료 (Δδ 기준, cos/sin 정리) |
+| **PSCAD 비교** | **진행 중** — load_step / line_trip 파형 수치 비교 (Δδ, ω, Te) |
 | **C** | AVR (IEEET1) / Governor (TGOV1) — 폐루프 제어, V/ω 회복 |
 | D | γ-corrected GENROU (PSS/E exact, E_fd override 안 해도 됨) |
 | E | Constant PQ 부하 + NR PF 모듈 → 진정한 voltage collapse 시뮬 가능 |
-| F | Multi-machine (bus 1과 2 모두 발전기, SMIB → multi) |
-| G | Single-line ground 또는 3-phase 단락 시나리오 (CDA 댐핑 도입 시점) |
-| H | 더 큰 swing 보기: gen을 bus 3 가까이 배치 / slack 제거 |
+| F | Multi-machine (SMIB → multi) |
 
 **다음 세션 시작 시 추천 진입점**:
-1. **PSCAD 비교** (현재 환산값 활용) — 우리 코드 검증
-2. **C (AVR/Gov)** — V·ω 자동 회복 추가
+1. **PSCAD 파형 수치 비교** — Δδ / ω / Te 정량적 일치 확인 (load_step, line_trip)
+2. **C (AVR/Gov)** — IEEET1 + TGOV1 도입
 3. **E (Constant PQ)** — voltage collapse, NR PF 도입
 
 **부속 문서**:

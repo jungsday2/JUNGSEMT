@@ -51,6 +51,11 @@ class VoltageSource(BaseComponent):
         self._phase_offsets = full_offsets[:n]
 
         self._t = 0.0   # 현재 시각 (predict_state에서 갱신)
+        self._active = True  # False면 G·I stamping 모두 skip (섬운전 전환용)
+
+    def set_active(self, active: bool):
+        """True: 정상 동작. False: G·I stamping 모두 skip (섬운전 전환 시 호출 후 rebuild_G() 필요)."""
+        self._active = active
 
     # ------------------------------------------------------------
     # 시간 정보 갱신 (이산화 아님, 단지 함수값 평가용 t 캐싱)
@@ -62,6 +67,8 @@ class VoltageSource(BaseComponent):
     # G 행렬 stamping (shunt: 내부 저항을 모선 대각에)
     # ------------------------------------------------------------
     def stamp_G(self, G_matrix):
+        if not self._active:
+            return
         n = self._phases
         i0 = self._slot * n
         for ph in range(n):
@@ -72,6 +79,8 @@ class VoltageSource(BaseComponent):
     # 부호 규약: 능동 전원이 모선으로 전류 유입 → I_total[bus]에 + 누적
     # ------------------------------------------------------------
     def stamp_history_current(self, I_total):
+        if not self._active:
+            return
         v_phase = self.V_mag * np.cos(
             self.omega * self._t + self.V_angle + self._phase_offsets
         )
@@ -87,10 +96,14 @@ class VoltageSource(BaseComponent):
     # ============================================================
     def stamp_Y_phasor(self, Y_matrix, omega):
         """모선 대각에 G_int = 1/R_internal (실수)를 누적."""
+        if not self._active:
+            return
         Y_matrix[self._slot, self._slot] += self.G_int
 
     def stamp_I_phasor(self, I_vector, omega):
         """노턴 전류원 위상자: I_norton = V_source_phasor / R_internal (peak amplitude)."""
+        if not self._active:
+            return
         V_p = self.V_mag * np.exp(1j * self.V_angle)   # a상 위상자 (peak)
         I_vector[self._slot] += V_p * self.G_int
 

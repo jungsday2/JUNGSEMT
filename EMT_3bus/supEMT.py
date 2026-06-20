@@ -192,3 +192,6 @@ class BaseComponent:
 
     def initialize_states(self, V_phasor, omega, dt):
         pass
+
+    def update_phasor_voltage(self, V_phasor):
+        pass
